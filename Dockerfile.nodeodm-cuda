@@ -1,0 +1,148 @@
+# Custom nodeodm:gpu build with CUDA-enabled OpenCV for GPU-accelerated feature matching
+#
+# This Dockerfile rebuilds OpenCV 4.5.0 with CUDA support on top of the
+# existing opendronemap/nodeodm:gpu image, then patches OpenSfM's matching.py
+# to use cv2.cuda.DescriptorMatcher for brute-force matching on the GPU.
+#
+# Build:
+#   docker build -f Dockerfile.nodeodm-cuda -t nodeodm-cuda:latest .
+#
+# Run (same as nodeodm:gpu, needs NVIDIA Container Toolkit):
+#   docker run --gpus all -p 3000:3000 nodeodm-cuda:latest
+#
+# Usage in WebODM:
+#   Replace the image in docker-compose.nodeodm.gpu.nvidia.yml:
+#     image: nodeodm-cuda:latest
+
+# === Stage 1: Rebuild OpenCV with CUDA ===
+FROM nvidia/cuda:11.8.0-devel-ubuntu20.04 AS opencv-builder
+
+ARG CUDA_ARCH_BIN=8.6
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    unzip \
+    pkg-config \
+    python3-dev \
+    python3-numpy \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libgtk-3-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libtiff-dev \
+    libv4l-dev \
+    libatlas-base-dev \
+    gfortran \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Download OpenCV 4.5.0 + contrib (same version as ODM uses)
+RUN wget -q https://github.com/opencv/opencv/archive/4.5.0.zip -O opencv.zip \
+    && wget -q https://github.com/opencv/opencv_contrib/archive/4.5.0.zip -O opencv_contrib.zip \
+    && unzip -q opencv.zip \
+    && unzip -q opencv_contrib.zip
+
+RUN mkdir opencv-build && cd opencv-build && cmake \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/opencv-install \
+    # Core modules needed by ODM/OpenSfM
+    -DBUILD_opencv_core=ON \
+    -DBUILD_opencv_imgproc=ON \
+    -DBUILD_opencv_highgui=ON \
+    -DBUILD_opencv_video=ON \
+    -DBUILD_opencv_ml=ON \
+    -DBUILD_opencv_features2d=ON \
+    -DBUILD_opencv_calib3d=ON \
+    -DBUILD_opencv_flann=ON \
+    -DBUILD_opencv_objdetect=ON \
+    -DBUILD_opencv_photo=ON \
+    -DBUILD_opencv_imgcodecs=ON \
+    -DBUILD_opencv_videoio=ON \
+    # Python bindings
+    -DBUILD_opencv_python3=ON \
+    -DPYTHON3_EXECUTABLE=/usr/bin/python3 \
+    # CUDA support
+    -DWITH_CUDA=ON \
+    -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+    -DCUDA_ARCH_BIN="${CUDA_ARCH_BIN:-8.6}" \
+    -DCUDA_ARCH_PTX="" \
+    -DWITH_CUBLAS=ON \
+    -DWITH_CUFFT=ON \
+    -DCUDA_FAST_MATH=ON \
+    # opencv_contrib for cudafeatures2d, xfeatures2d
+    -DOPENCV_EXTRA_MODULES_PATH=/build/opencv_contrib-4.5.0/modules \
+    -DBUILD_opencv_xfeatures2d=ON \
+    -DBUILD_opencv_cudafeatures2d=ON \
+    -DBUILD_opencv_cudaimgproc=ON \
+    -DBUILD_opencv_cudawarping=ON \
+    -DBUILD_opencv_cudaarithm=ON \
+    -DBUILD_opencv_cudafilters=ON \
+    # Video support
+    -DWITH_FFMPEG=ON \
+    -DWITH_GSTREAMER=OFF \
+    # Disable unneeded modules to speed up build
+    -DWITH_GTK=OFF \
+    -DWITH_VTK=OFF \
+    -DWITH_OPENNI=OFF \
+    -DWITH_OPENEXR=OFF \
+    -DBUILD_EXAMPLES=OFF \
+    -DBUILD_TESTS=OFF \
+    -DBUILD_PERF_TESTS=OFF \
+    -DBUILD_DOCS=OFF \
+    -DBUILD_opencv_apps=OFF \
+    -DBUILD_opencv_videostab=OFF \
+    -DBUILD_opencv_stitching=OFF \
+    -DBUILD_opencv_world=OFF \
+    -DBUILD_opencv_superres=OFF \
+    -DBUILD_opencv_java=OFF \
+    -DBUILD_opencv_ts=OFF \
+    -DBUILD_opencv_dnn=OFF \
+    -DOPENCV_ALLOCATOR_STATS_COUNTER_TYPE=int64_t \
+    /build/opencv-4.5.0
+
+# Build with all available cores
+RUN cd opencv-build && make -j"$(nproc)" && make install
+
+# Collect CUDA runtime libs that OpenCV needs into a single dir for easy COPY
+RUN mkdir /cuda-libs && \
+    cp -a /usr/local/cuda/lib64/libcudart.so* \
+          /usr/local/cuda/lib64/libcublas.so* \
+          /usr/local/cuda/lib64/libcublasLt.so* \
+          /usr/local/cuda/lib64/libcufft.so* \
+          /usr/local/cuda/lib64/libnppc.so* \
+          /usr/local/cuda/lib64/libnppig.so* \
+          /usr/local/cuda/lib64/libnppif.so* \
+          /usr/local/cuda/lib64/libnppial.so* \
+          /usr/local/cuda/lib64/libnppicc.so* \
+          /usr/local/cuda/lib64/libnppidei.so* \
+          /usr/local/cuda/lib64/libnppist.so* \
+          /usr/local/cuda/lib64/libnppitc.so* \
+          /cuda-libs/ 2>/dev/null || true
+
+
+# === Stage 2: Patch the existing nodeodm:gpu image ===
+FROM opendronemap/nodeodm:gpu
+
+# Copy CUDA-enabled OpenCV libraries over existing ones
+COPY --from=opencv-builder /opencv-install/lib/ /code/SuperBuild/install/lib/
+
+# Copy Python bindings
+COPY --from=opencv-builder /opencv-install/lib/python3.8/dist-packages/cv2/ /code/SuperBuild/install/lib/python3.8/dist-packages/cv2/
+
+# Copy CUDA runtime libs needed by OpenCV CUDA modules
+# (the base nodeodm:gpu has nvidia/cuda:11.8.0-runtime but may miss some libs)
+COPY --from=opencv-builder /cuda-libs/ /usr/local/cuda/lib64/
+
+# Patch OpenSfM matching.py with CUDA support
+COPY patch_matching_cuda.py /tmp/patch_matching_cuda.py
+RUN python3 /tmp/patch_matching_cuda.py /code/SuperBuild/install/bin/opensfm/opensfm/matching.py
+
+# Ensure CUDA libs are on the library path
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"

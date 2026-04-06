@@ -15,6 +15,8 @@
 !requirements.txt
 !setup.cfg
 !setup.py
+!patch_matching_cuda.py
+!Dockerfile.nodeodm-cuda
 !viewer
 
 # Picking exceptions
